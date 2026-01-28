@@ -6,7 +6,7 @@ import { generateQr } from "./helper/generateQr.js";
 import { supabase } from "./supabaseClient.js";
 import { FavoritesService } from "./service/favorites.js";
 import { Swiper, SwiperSlide } from 'swiper/react';
-import { Navigation, Mousewheel, FreeMode, Pagination, Autoplay, EffectFade } from 'swiper/modules';
+import { Navigation, Pagination, Autoplay, EffectFade } from 'swiper/modules';
 import 'swiper/css';
 import 'swiper/css/navigation';
 import 'swiper/css/free-mode';
@@ -53,7 +53,7 @@ function App() {
     const [isFavorite, setIsFavorite] = useState(false);
     const [isSearchExpanded, setIsSearchExpanded] = useState(false);
     const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
-    const [sortOrder, setSortOrder] = useState('asc');
+    const [sortOrder, setSortOrder] = useState('default');
     const [viewMode, setViewMode] = useState('grid');
     const [page, setPage] = useState(1);
     const [hasMore, setHasMore] = useState(true);
@@ -61,11 +61,15 @@ function App() {
     const [activeTab, setActiveTab] = useState('inicio');
     const [contentType, setContentType] = useState('movie');
     const [historyFilter, setHistoryFilter] = useState('all');
-    const navRef = useRef(null);
     const searchInputRef = useRef(null);
 
     const [theme, setTheme] = useState(localStorage.getItem('theme') || 'system');
     const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+
+    const loadFavorites = async () => {
+        const favorites = await FavoritesService.fetchFavorites();
+        setMovies(favorites);
+    }
 
     useEffect(() => {
         const element = document.documentElement;
@@ -104,13 +108,41 @@ function App() {
 
                 setHeroMovies(combined);
             } catch (error) {
-                console.error("Error fetching hero content:", error);
+                console.error("No se puede hacer fetch:", error);
             }
         };
 
         fetchHeroContent();
         fetchMovies('mixed', 'popular', 1);
     }, []);
+
+    useEffect(() => {
+        const channel = supabase
+            .channel('realtime-history')
+            .on(
+                'postgres_changes',
+                {
+                    event: 'INSERT',
+                    schema: 'public',
+                    table: 'history',
+                },
+                (payload) => {
+                    if (activeTab === 'historial') {
+                        setMovies((prevMovies) => [payload.new, ...prevMovies]);
+                    }
+                }
+            )
+            .subscribe();
+
+        return () => {
+            supabase.removeChannel(channel);
+        };
+    }, [activeTab]);
+
+    useEffect(() => {
+        if (activeTab === 'lista')
+            loadFavorites()
+    }, [activeTab]);
 
     const addToHistory = async (movie) => {
         const type = movie.media_type || contentType;
@@ -142,18 +174,37 @@ function App() {
     };
 
     const fetchFavorites = async () => {
-        const favs = await FavoritesService.fetchFavorites();
-        setMovies(favs);
+        const { data, error } = await supabase
+            .from('favorites')
+            .select('*')
+            .order('created_at', { ascending: false });
+
+        if (error) console.error("Error cargando favoritos", error);
+        else setMovies(data || []);
     };
 
     const toggleFavorite = async () => {
         if (isFavorite) {
-            await FavoritesService.removeFavorite(selected.id);
-            setIsFavorite(false);
-            if (activeTab === 'lista') fetchFavorites();
+            const { error } = await supabase.from('favorites').delete().eq('id', selected.id);
+            if (!error) {
+                setIsFavorite(false);
+                if (activeTab === 'lista') fetchFavorites();
+            }
         } else {
-            await FavoritesService.addFavorite(selected, CURRENT_USER);
-            setIsFavorite(true);
+            const type = selected.media_type || (selected.name ? 'tv' : 'movie');
+            const { error } = await supabase.from('favorites').insert({
+                id: selected.id,
+                title: selected.title || selected.name,
+                poster_path: selected.poster_path,
+                release_date: selected.release_date || selected.first_air_date,
+                media_type: type,
+                user_name: CURRENT_USER
+            });
+            if (!error) {
+                setIsFavorite(true);
+            } else {
+                console.error("Error al guardar favorito:", error);
+            }
         }
     };
 
@@ -238,12 +289,14 @@ function App() {
     };
 
     const handleNavClick = (tabId) => {
+
         setActiveTab(tabId);
         setSearchTerm("");
         setIsSearching(false);
         setActiveCategory('popular');
         setHistoryFilter('all');
         setIsMobileMenuOpen(false);
+        setSortOrder('default');
         setViewMode('grid');
         setPage(1);
         setHasMore(true);
@@ -343,8 +396,8 @@ function App() {
         setQrCode(null);
         setTrailerKey(null);
 
-        const isFav = await FavoritesService.isFavorite(movie.id);
-        setIsFavorite(isFav);
+        const { data: favData } = await supabase.from('favorites').select('id').eq('id', movie.id).single();
+        setIsFavorite(!!favData);
 
         const typePath = (movie.media_type === 'tv' || contentType === 'tv') ? 'tv' : 'movie';
 
@@ -352,23 +405,34 @@ function App() {
         setQrCode(qr);
 
         try {
-            const videoData = await ApiMovie.getMovieVideos(movie.id);
-            const results = videoData.results || [];
+            const videoData = (movie.media_type === 'tv' || contentType === 'tv')
+                ? await ApiMovie.getTvVideos(movie.id)
+                : await ApiMovie.getMovieVideos(movie.id);
 
-            let officialTrailer = results.find(
-                (vid) => vid.site === "YouTube" && vid.type === "Trailer" && vid.iso_639_1 === "es"
-            );
+            const videos = videoData.results || [];
 
-            if (!officialTrailer) {
-                officialTrailer = results.find(
-                    (vid) => vid.site === "YouTube" && vid.type === "Trailer" && vid.iso_639_1 === "en"
-                );
-            }
+            const youtubeVideos = videos.filter(v => v.site === "YouTube");
+            const originalLang = movie.original_language;
 
-            if (officialTrailer) {
-                setTrailerKey(officialTrailer.key);
-            } else if (results.length > 0) {
-                setTrailerKey(results[0].key);
+            const findExact = (type, lang, region) => youtubeVideos.find(v => v.type === type && v.iso_639_1 === lang && v.iso_3166_1 === region);
+            const findLang = (type, lang) => youtubeVideos.find(v => v.type === type && v.iso_639_1 === lang);
+
+            let bestVideo = null;
+
+            if (!bestVideo) bestVideo = findExact("Trailer", "es", "MX");
+            if (!bestVideo) bestVideo = findExact("Trailer", "es", "ES");
+            if (!bestVideo) bestVideo = findLang("Trailer", "es");
+            if (!bestVideo) bestVideo = findLang("Trailer", "en");
+            if (!bestVideo && originalLang !== "en" && originalLang !== "es") bestVideo = findLang("Trailer", originalLang);
+
+            if (!bestVideo) bestVideo = findExact("Teaser", "es", "MX");
+            if (!bestVideo) bestVideo = findExact("Teaser", "es", "ES");
+            if (!bestVideo) bestVideo = findLang("Teaser", "es");
+            if (!bestVideo) bestVideo = findLang("Teaser", "en");
+            if (!bestVideo && originalLang !== "en" && originalLang !== "es") bestVideo = findLang("Teaser", originalLang);
+
+            if (bestVideo) {
+                setTrailerKey(bestVideo.key);
             }
         } catch (error) {
             console.error("Error buscando trailer:", error);
@@ -380,6 +444,10 @@ function App() {
 
         if (activeTab === 'historial' && historyFilter !== 'all') {
             filtered = movies.filter(m => m.media_type === historyFilter);
+        }
+
+        if (sortOrder === 'default') {
+            return filtered;
         }
 
         return [...filtered].sort((a, b) => {
@@ -420,7 +488,7 @@ function App() {
                                 <img src={`https://api.dicebear.com/7.x/avataaars/svg?seed=${movie.scanned_by || 'Unknown'}`} className="w-full h-full rounded-full bg-black" />
                             </div>
                             <span className="text-[10px] text-white/90 font-medium">
-                                Escaneado por: {movie.scanned_by || 'Desconocido'}
+                                Escaneado por: {movie.scanned_by || 'Desconocido' }
                             </span>
                         </div>
                     </div>
@@ -621,14 +689,24 @@ function App() {
 
                     <div className="max-w-[1920px] mx-auto px-6">
                         {(activeTab === 'lista') && !isSearching ? (
-                            <div className="flex flex-col items-center justify-center h-[50vh] text-center">
-                                <h2 className="text-3xl font-bold text-gray-400 dark:text-neutral-500 mb-4">
-                                    Mi Lista
-                                </h2>
-                                <p className="text-gray-500 dark:text-neutral-400">
-                                    {movies.length > 0 ? "Tus favoritos" : "Aún no has agregado favoritos."}
-                                </p>
-                            </div>
+                            <>
+                                <div className="flex flex-col items-center justify-center mb-8 text-center">
+                                    <h2 className="text-3xl font-bold text-gray-400 dark:text-neutral-500 mb-4">
+                                        Mi Lista
+                                    </h2>
+                                    <p className="text-gray-500 dark:text-neutral-400">
+                                        {movies.length > 0 ? `Tienes ${movies.length} favorito${movies.length !== 1 ? 's' : ''}` : "Aún no has agregado favoritos."}
+                                    </p>
+                                </div>
+
+                                {movies.length > 0 && (
+                                    <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 gap-6">
+                                        {movies.map((movie) => (
+                                            <MovieCard key={movie.id} movie={movie} />
+                                        ))}
+                                    </div>
+                                )}
+                            </>
                         ) : (
                             <>
                                 {!isSearching && activeTab !== 'inicio' && (
@@ -698,10 +776,10 @@ function App() {
                                         <div className="flex items-center gap-2 bg-white/80 dark:bg-neutral-950/80 p-2 rounded-full border border-gray-200 dark:border-white/10 shadow-xl backdrop-blur-xl">
 
                                             <button
-                                                onClick={() => setSortOrder(sortOrder === 'asc' ? 'desc' : 'asc')}
+                                                onClick={() => setSortOrder(prev => prev === 'asc' ? 'desc' : 'asc')}
                                                 className="p-2 rounded-full hover:bg-gray-200 dark:hover:bg-white/10 transition-colors text-gray-600 dark:text-gray-300 flex items-center gap-2 px-3 text-xs font-bold"
                                             >
-                                                {sortOrder === 'asc' ? 'A-Z' : 'Z-A'}
+                                                {sortOrder === 'desc' ? 'Z-A' : 'A-Z'}
                                                 <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className="w-4 h-4">
                                                     <path strokeLinecap="round" strokeLinejoin="round" d="M3 7.5L7.5 3m0 0L12 7.5M7.5 3v13.5m13.5 0L16.5 21m0 0L12 16.5m4.5 4.5V7.5" />
                                                 </svg>
